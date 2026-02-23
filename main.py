@@ -17,15 +17,13 @@ API_KEY = os.getenv("API_KEY", "troque-esta-chave")
 
 
 class RunRequest(BaseModel):
-    # Cookies de sessao do LinkedIn (obrigatorio)
-    li_at: str           # cookie principal de autenticacao
-    jsessionid: str      # cookie de sessao (sem aspas)
-
+    li_at: str
+    jsessionid: str      # ex: ajax:0042554627771215124  (sem aspas)
     keywords: list[str] = ["product manager senior"]
     max_messages: int = 10
     delay_min: int = 3
     delay_max: int = 7
-    dry_run: bool = False  # True = so lista quem receberia, NAO envia
+    dry_run: bool = False
     message_template: str = (
         "Ola {nome}, tudo bem?\n\n"
         "Vi seu perfil e fiquei interessado no seu trabalho como {cargo}.\n"
@@ -98,37 +96,54 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
             ),
         )
 
-        # Injeta cookies de sessao diretamente (sem precisar fazer login)
-        jsessionid_value = cfg.jsessionid.strip('"')  # remove aspas se houver
+        # Limpa aspas do jsessionid e formata corretamente
+        jsessionid_clean = cfg.jsessionid.strip().strip('"')
+        # O LinkedIn espera o JSESSIONID com aspas duplas ao redor
+        jsessionid_value = f'"{jsessionid_clean}"'
+
         await context.add_cookies([
             {
-                "name": "li_at",
-                "value": cfg.li_at,
-                "domain": ".linkedin.com",
-                "path": "/",
+                "name":     "li_at",
+                "value":    cfg.li_at.strip(),
+                "domain":   ".linkedin.com",
+                "path":     "/",
                 "httpOnly": True,
-                "secure": True,
+                "secure":   True,
+                "sameSite": "None",
             },
             {
-                "name": "JSESSIONID",
-                "value": f'"{jsessionid_value}"',
-                "domain": ".linkedin.com",
-                "path": "/",
+                "name":     "JSESSIONID",
+                "value":    jsessionid_value,
+                "domain":   ".linkedin.com",
+                "path":     "/",
                 "httpOnly": False,
-                "secure": True,
+                "secure":   True,
+                "sameSite": "None",
+            },
+            {
+                "name":     "bcookie",
+                "value":    "v=2&placeholder",
+                "domain":   ".linkedin.com",
+                "path":     "/",
+                "httpOnly": False,
+                "secure":   True,
             },
         ])
 
         page = await context.new_page()
 
-        # Verifica se a sessao esta valida
-        await page.goto("https://www.linkedin.com/feed/")
-        await page.wait_for_load_state("networkidle")
-        await _random_delay(2, 3)
+        # Navega direto para busca (evita loop de redirect do /feed)
+        await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+        await _random_delay(3, 5)
 
-        if "authwall" in page.url or "login" in page.url:
+        # Verifica sessao pelo URL atual
+        current_url = page.url
+        if "authwall" in current_url or "login" in current_url or "checkpoint" in current_url:
             await browser.close()
-            raise Exception("Cookies invalidos ou expirados. Atualize os cookies li_at e JSESSIONID.")
+            raise Exception(
+                "Cookies invalidos ou expirados. "
+                "Atualize os valores de li_at e JSESSIONID do seu LinkedIn."
+            )
 
         # BUSCA
         for keyword in cfg.keywords:
@@ -140,8 +155,7 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
                 f"?keywords={keyword.replace(' ', '%20')}"
                 f"&origin=GLOBAL_SEARCH_HEADER"
             )
-            await page.goto(search_url)
-            await page.wait_for_load_state("networkidle")
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
             await _random_delay(2, 3)
 
             profiles = []
@@ -165,7 +179,6 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
                 except Exception:
                     continue
 
-            # PERCORRE PERFIS
             for profile in profiles:
                 if results["totalSent"] >= cfg.max_messages:
                     break
@@ -173,8 +186,7 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
                 await _random_delay(cfg.delay_min, cfg.delay_max)
 
                 try:
-                    await page.goto(profile["url"])
-                    await page.wait_for_load_state("networkidle")
+                    await page.goto(profile["url"], wait_until="domcontentloaded", timeout=30000)
                     await _random_delay(2, 3)
 
                     btn_selectors = [
@@ -194,7 +206,7 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
 
                     message_preview = _build_message(cfg.message_template, profile["name"], profile["title"])
 
-                    # DRY RUN: so registra, nao envia
+                    # DRY RUN
                     if cfg.dry_run:
                         results["would_send"].append({
                             "name":            profile["name"],
