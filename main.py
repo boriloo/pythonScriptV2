@@ -1,8 +1,8 @@
 """
 LinkedIn Automation API - FastAPI
 ----------------------------------
-Endpoint POST /run  →  executa busca + envio de mensagens no LinkedIn
-Parâmetro dry_run=true → só lista quem receberia, sem enviar nada
+Endpoint POST /run  -> executa busca + envio de mensagens no LinkedIn
+Usa cookies de sessao ao inves de email/senha para evitar bloqueio de login
 """
 
 import asyncio
@@ -17,13 +17,15 @@ API_KEY = os.getenv("API_KEY", "troque-esta-chave")
 
 
 class RunRequest(BaseModel):
-    email: str
-    password: str
+    # Cookies de sessao do LinkedIn (obrigatorio)
+    li_at: str           # cookie principal de autenticacao
+    jsessionid: str      # cookie de sessao (sem aspas)
+
     keywords: list[str] = ["product manager senior"]
     max_messages: int = 10
     delay_min: int = 3
     delay_max: int = 7
-    dry_run: bool = False  # True = só lista quem receberia, NAO envia
+    dry_run: bool = False  # True = so lista quem receberia, NAO envia
     message_template: str = (
         "Ola {nome}, tudo bem?\n\n"
         "Vi seu perfil e fiquei interessado no seu trabalho como {cargo}.\n"
@@ -36,8 +38,8 @@ class RunResponse(BaseModel):
     success: bool
     dry_run: bool
     summary: dict
-    would_send: list   # em dry_run, quem receberia
-    sent: list         # em modo real, quem recebeu
+    would_send: list
+    sent: list
     skipped: list
     errors: list
 
@@ -95,20 +97,38 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
+
+        # Injeta cookies de sessao diretamente (sem precisar fazer login)
+        jsessionid_value = cfg.jsessionid.strip('"')  # remove aspas se houver
+        await context.add_cookies([
+            {
+                "name": "li_at",
+                "value": cfg.li_at,
+                "domain": ".linkedin.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+            },
+            {
+                "name": "JSESSIONID",
+                "value": f'"{jsessionid_value}"',
+                "domain": ".linkedin.com",
+                "path": "/",
+                "httpOnly": False,
+                "secure": True,
+            },
+        ])
+
         page = await context.new_page()
 
-        # LOGIN
-        await page.goto("https://www.linkedin.com/login")
-        await page.fill("#username", cfg.email)
-        await page.fill("#password", cfg.password)
-        await page.click('[type="submit"]')
+        # Verifica se a sessao esta valida
+        await page.goto("https://www.linkedin.com/feed/")
         await page.wait_for_load_state("networkidle")
-        await _random_delay(2, 4)
+        await _random_delay(2, 3)
 
-        logged_in = "feed" in page.url or "mynetwork" in page.url
-        if not logged_in:
+        if "authwall" in page.url or "login" in page.url:
             await browser.close()
-            raise Exception("Login falhou. Verifique credenciais ou CAPTCHA.")
+            raise Exception("Cookies invalidos ou expirados. Atualize os cookies li_at e JSESSIONID.")
 
         # BUSCA
         for keyword in cfg.keywords:
