@@ -2,6 +2,7 @@
 LinkedIn Automation API - FastAPI
 ----------------------------------
 Endpoint POST /run  →  executa busca + envio de mensagens no LinkedIn
+Parâmetro dry_run=true → só lista quem receberia, sem enviar nada
 """
 
 import asyncio
@@ -22,8 +23,9 @@ class RunRequest(BaseModel):
     max_messages: int = 10
     delay_min: int = 3
     delay_max: int = 7
+    dry_run: bool = False  # True = só lista quem receberia, NAO envia
     message_template: str = (
-        "Olá {nome}, tudo bem?\n\n"
+        "Ola {nome}, tudo bem?\n\n"
         "Vi seu perfil e fiquei interessado no seu trabalho como {cargo}.\n"
         "Gostaria de trocar uma ideia sobre [seu motivo aqui].\n\n"
         "Podemos conversar?"
@@ -32,8 +34,10 @@ class RunRequest(BaseModel):
 
 class RunResponse(BaseModel):
     success: bool
+    dry_run: bool
     summary: dict
-    sent: list
+    would_send: list   # em dry_run, quem receberia
+    sent: list         # em modo real, quem recebeu
     skipped: list
     errors: list
 
@@ -49,7 +53,7 @@ def health():
 @app.post("/run", response_model=RunResponse)
 async def run(body: RunRequest, x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="API Key inválida")
+        raise HTTPException(status_code=401, detail="API Key invalida")
     try:
         result = await _run_automation(body)
         return result
@@ -71,7 +75,7 @@ def _build_message(template: str, name: str, title: str) -> str:
 
 
 async def _run_automation(cfg: RunRequest) -> RunResponse:
-    results = {"sent": [], "skipped": [], "errors": [], "totalSent": 0}
+    results = {"sent": [], "would_send": [], "skipped": [], "errors": [], "totalSent": 0}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -106,7 +110,7 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
             await browser.close()
             raise Exception("Login falhou. Verifique credenciais ou CAPTCHA.")
 
-        # BUSCA E ENVIO
+        # BUSCA
         for keyword in cfg.keywords:
             if results["totalSent"] >= cfg.max_messages:
                 break
@@ -141,6 +145,7 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
                 except Exception:
                     continue
 
+            # PERCORRE PERFIS
             for profile in profiles:
                 if results["totalSent"] >= cfg.max_messages:
                     break
@@ -164,7 +169,20 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
                             break
 
                     if not msg_btn:
-                        results["skipped"].append({**profile, "reason": "Botão mensagem não encontrado"})
+                        results["skipped"].append({**profile, "reason": "Botao mensagem nao encontrado (nao e conexao)"})
+                        continue
+
+                    message_preview = _build_message(cfg.message_template, profile["name"], profile["title"])
+
+                    # DRY RUN: so registra, nao envia
+                    if cfg.dry_run:
+                        results["would_send"].append({
+                            "name":            profile["name"],
+                            "title":           profile["title"],
+                            "url":             profile["url"],
+                            "message_preview": message_preview,
+                        })
+                        results["totalSent"] += 1
                         continue
 
                     await msg_btn.click()
@@ -174,12 +192,11 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
                     if not msg_box:
                         msg_box = await page.query_selector('[role="textbox"]')
                     if not msg_box:
-                        results["skipped"].append({**profile, "reason": "Campo de texto não encontrado"})
+                        results["skipped"].append({**profile, "reason": "Campo de texto nao encontrado"})
                         continue
 
-                    message = _build_message(cfg.message_template, profile["name"], profile["title"])
                     await msg_box.click()
-                    await msg_box.fill(message)
+                    await msg_box.fill(message_preview)
                     await _random_delay(0.8, 1.5)
 
                     send_btn = await page.query_selector(".msg-form__send-button")
@@ -204,11 +221,14 @@ async def _run_automation(cfg: RunRequest) -> RunResponse:
 
     return RunResponse(
         success=True,
+        dry_run=cfg.dry_run,
         summary={
+            "mode":         "dry_run (simulacao)" if cfg.dry_run else "real (mensagens enviadas)",
             "totalSent":    results["totalSent"],
             "totalSkipped": len(results["skipped"]),
             "totalErrors":  len(results["errors"]),
         },
+        would_send=results["would_send"],
         sent=results["sent"],
         skipped=results["skipped"],
         errors=results["errors"],
